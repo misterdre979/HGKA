@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Generates migrations, models, validation registry, permission seeder and frontend resource config from spec.py."""
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import spec  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+BE = ROOT / 'backend' / 'overlay'
+FE = ROOT / 'frontend' / 'src' / 'config'
+RES = {r['key']: r for r in spec.RESOURCES}
+
+
+# ------------------------------------------------------------------ helpers
+def php(v):
+    if v is None:
+        return 'null'
+    if v is True:
+        return 'true'
+    if v is False:
+        return 'false'
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return "'" + v.replace('\\', '\\\\').replace("'", "\\'") + "'"
+    if isinstance(v, (list, tuple)):
+        return '[' + ', '.join(php(x) for x in v) + ']'
+    if isinstance(v, dict):
+        return '[' + ', '.join(f'{php(k)} => {php(x)}' for k, x in v.items()) + ']'
+    raise TypeError(v)
+
+
+def camel(name):
+    base = name[:-3] if name.endswith('_id') else name
+    parts = base.split('_')
+    return parts[0] + ''.join(p.title() for p in parts[1:])
+
+
+def rel_key(name):
+    return name[:-3] if name.endswith('_id') else name
+
+
+def label_of(fld):
+    if fld.get('label'):
+        return fld['label']
+    return rel_key(fld['name']).replace('_', ' ').capitalize()
+
+
+def write(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+# ------------------------------------------------------------------ migrations
+def column(fl):
+    t, n = fl['type'], fl['name']
+    nullable = not fl.get('req') and 'default' not in fl and t != 'bool'
+    if t == 'string':
+        c = f"$table->string('{n}', {fl.get('max', 255)})"
+    elif t == 'text':
+        c = f"$table->text('{n}')"
+    elif t == 'int':
+        c = f"$table->integer('{n}')"
+    elif t == 'decimal':
+        c = f"$table->decimal('{n}', {fl.get('prec', 12)}, 2)"
+    elif t == 'date':
+        c = f"$table->date('{n}')"
+    elif t == 'time':
+        c = f"$table->time('{n}')"
+    elif t == 'datetime':
+        c = f"$table->dateTime('{n}')"
+    elif t == 'bool':
+        c = f"$table->boolean('{n}')"
+    elif t == 'enum':
+        c = f"$table->enum('{n}', {php(fl['vals'])})"
+    elif t == 'json':
+        c = f"$table->json('{n}')"
+    elif t == 'fk':
+        c = f"$table->foreignId('{n}')"
+    else:
+        raise ValueError(t)
+    if nullable:
+        c += '->nullable()'
+    if t == 'bool':
+        c += f"->default({php(fl.get('default', False))})"
+    elif 'default' in fl:
+        c += f"->default({php(fl['default'])})"
+    if fl.get('uniq'):
+        c += '->unique()'
+    elif fl.get('idx') and t != 'fk':
+        c += '->index()'
+    if t == 'fk':
+        tbl = RES[fl['ref']]['table']
+        c += f"->constrained('{tbl}')"
+        if fl.get('cascade'):
+            c += '->cascadeOnDelete()'
+        elif nullable:
+            c += '->nullOnDelete()'
+        else:
+            c += '->restrictOnDelete()'
+    return c + ';'
+
+
+def migration(group, resources, number):
+    ups, downs, post_up, post_down = [], [], [], []
+    for r in resources:
+        late = [f for f in r['fields'] if f.get('late')]
+        if r.get('migrate', True):
+            lines = ["        Schema::create('%s', function (Blueprint $table) {" % r['table'], "            $table->id();"]
+            for fl in r['fields']:
+                if fl.get('late'):
+                    continue
+                lines.append('            ' + column(fl))
+            if r.get('ts', True):
+                lines.append('            $table->timestamps();')
+            for cols in r.get('uniq_together', []):
+                name = f"{r['table']}_{'_'.join(cols)}_unique"
+                if len(name) > 60:
+                    name = r['table'][:30] + '_' + hashlib.md5(name.encode()).hexdigest()[:8] + '_unique'
+                lines.append(f"            $table->unique({php(list(cols))}, '{name}');")
+            lines.append('        });')
+            ups.append('\n'.join(lines))
+            downs.insert(0, f"        Schema::dropIfExists('{r['table']}');")
+        elif r.get('uniq_together') and False:
+            pass
+        for fl in late:
+            tbl = RES[fl['ref']]['table']
+            post_up.append(
+                f"        Schema::table('{r['table']}', function (Blueprint $table) {{\n"
+                f"            $table->foreignId('{fl['name']}')->nullable()->constrained('{tbl}')->nullOnDelete();\n"
+                f"        }});")
+            post_down.insert(0,
+                f"        Schema::table('{r['table']}', function (Blueprint $table) {{\n"
+                f"            $table->dropConstrainedForeignId('{fl['name']}');\n"
+                f"        }});")
+    body = '\n\n'.join(ups + post_up)
+    down = '\n'.join(post_down + downs)
+    return f"""<?php
+// GENERATED by tools/generate.py ({group}). Edit tools/spec.py instead.
+
+use Illuminate\\Database\\Migrations\\Migration;
+use Illuminate\\Database\\Schema\\Blueprint;
+use Illuminate\\Support\\Facades\\Schema;
+
+return new class extends Migration
+{{
+    public function up(): void
+    {{
+{body}
+    }}
+
+    public function down(): void
+    {{
+{down}
+    }}
+}};
+"""
+
+
+# ------------------------------------------------------------------ models
+EXTRAS = {
+    'Student': """
+    public function guardians()
+    {
+        return $this->belongsToMany(Guardian::class, 'guardian_student')->withPivot('is_primary');
+    }
+
+    public function results() { return $this->hasMany(Result::class); }
+    public function invoices() { return $this->hasMany(Invoice::class); }
+    public function attendances() { return $this->hasMany(StudentAttendance::class); }
+    public function medicalProfile() { return $this->hasOne(MedicalProfile::class); }
+
+    protected $appends = ['photo_url'];
+
+    public function getPhotoUrlAttribute(): ?string
+    {
+        return $this->photo_path ? asset('storage/' . $this->photo_path) : null;
+    }
+
+    public function getFullNameAttribute(): string
+    {
+        return trim($this->first_name . ' ' . $this->last_name);
+    }
+""",
+    'Guardian': """
+    public function students()
+    {
+        return $this->belongsToMany(Student::class, 'guardian_student')->withPivot('is_primary');
+    }
+""",
+    'Staff': """
+    public function assignments() { return $this->hasMany(TeacherAssignment::class); }
+    public function salaryStructure() { return $this->hasOne(SalaryStructure::class); }
+    public function salaryComponents() { return $this->hasMany(SalaryComponent::class); }
+
+    protected $appends = ['photo_url'];
+
+    public function getPhotoUrlAttribute(): ?string
+    {
+        return $this->photo_path ? asset('storage/' . $this->photo_path) : null;
+    }
+
+    public function getFullNameAttribute(): string
+    {
+        return trim($this->first_name . ' ' . $this->last_name);
+    }
+""",
+    'Invoice': """
+    public function items() { return $this->hasMany(InvoiceItem::class); }
+    public function payments() { return $this->hasMany(Payment::class); }
+""",
+    'Book': """
+    public function loans() { return $this->hasMany(BookLoan::class); }
+""",
+    'PayrollRun': """
+    public function payslips() { return $this->hasMany(Payslip::class); }
+""",
+    'Hostel': """
+    public function rooms() { return $this->hasMany(HostelRoom::class); }
+""",
+    'HostelRoom': """
+    public function allocations() { return $this->hasMany(HostelAllocation::class); }
+""",
+    'ClassArm': """
+    public function students() { return $this->hasMany(Student::class); }
+""",
+    'SchoolClass': """
+    public function arms() { return $this->hasMany(ClassArm::class); }
+    public function students() { return $this->hasMany(Student::class); }
+""",
+    'AcademicSession': """
+    public function terms() { return $this->hasMany(Term::class); }
+""",
+}
+
+
+def model(r):
+    cast = {}
+    for fl in r['fields']:
+        t = fl['type']
+        if t == 'bool':
+            cast[fl['name']] = 'boolean'
+        elif t == 'json':
+            cast[fl['name']] = 'array'
+        elif t == 'decimal':
+            cast[fl['name']] = 'decimal:2'
+        elif t == 'date':
+            cast[fl['name']] = 'date:Y-m-d'
+        elif t == 'datetime':
+            cast[fl['name']] = 'datetime'
+    if r['model'] == 'AuditLog':
+        cast['created_at'] = 'datetime'
+    rels = []
+    for fl in r['fields']:
+        if fl['type'] != 'fk':
+            continue
+        target = RES[fl['ref']]['model']
+        target = 'User' if target == 'User' else target
+        rels.append(f"    public function {camel(fl['name'])}()\n    {{\n"
+                    f"        return $this->belongsTo({target}::class, '{fl['name']}');\n    }}\n")
+    fillable = [f['name'] for f in r['fields']]
+    ts = '' if r.get('ts', True) else "\n    public $timestamps = false;\n"
+    use_user = 'use App\\Models\\User;\n' if False else ''
+    return f"""<?php
+// GENERATED by tools/generate.py. Edit tools/spec.py instead.
+
+namespace App\\Models;
+
+use Illuminate\\Database\\Eloquent\\Model;
+
+class {r['model']} extends Model
+{{
+    protected $table = '{r['table']}';
+{ts}
+    protected $fillable = {php(fillable)};
+
+    protected $casts = {php(cast)};
+
+{chr(10).join(rels)}{EXTRAS.get(r['model'], '')}}}
+"""
+
+
+# ------------------------------------------------------------------ registry
+def rules_for(fl):
+    t = fl['type']
+    base = ['required'] if fl.get('req') else ['nullable']
+    if t == 'string':
+        base += ['string', f"max:{fl.get('max', 255)}"]
+        if fl['name'] == 'email':
+            base.insert(1, 'email')
+    elif t == 'text':
+        base += ['string', 'max:20000']
+    elif t == 'int':
+        base += ['integer']
+        if 'minv' in fl:
+            base.append(f"min:{fl['minv']}")
+        if 'maxv' in fl:
+            base.append(f"max:{fl['maxv']}")
+    elif t == 'decimal':
+        base += ['numeric', 'min:0']
+    elif t in ('date', 'datetime'):
+        base += ['date']
+    elif t == 'time':
+        base += ['regex:/^\\d{2}:\\d{2}(:\\d{2})?$/']
+    elif t == 'bool':
+        base += ['boolean']
+    elif t == 'enum':
+        base += ['in:' + ','.join(fl['vals'])]
+    elif t == 'fk':
+        base += ['integer', f"exists:{RES[fl['ref']]['table']},id"]
+    elif t == 'json':
+        base += ['array']
+    return base
+
+
+def perms_for(r):
+    m = r['module']
+    cat = spec.CATALOG.get(m, [])
+    view = r.get('pv', [f'{m}.view'])
+    if r.get('pw'):
+        w = {k: r['pw'] for k in ('create', 'update', 'delete')}
+    elif 'create' in cat:
+        w = {k: [f'{m}.{k}'] for k in ('create', 'update', 'delete')}
+    else:
+        w = {k: [f'{m}.manage'] for k in ('create', 'update', 'delete')}
+    return {'view': view, **w}
+
+
+def registry_entry(r):
+    fields = [f for f in r['fields'] if f.get('frm', True)]
+    rules = {f['name']: rules_for(f) for f in fields}
+    with_ = [camel(f['name']) for f in r['fields'] if f['type'] == 'fk' and (f.get('lst') or f.get('rel'))]
+    filters = [f['name'] for f in r['fields'] if f.get('flt')]
+    # fk fields are always filterable (used by dependent selects / list filters)
+    fk_filter = [f['name'] for f in r['fields'] if f['type'] == 'fk']
+    sortable = ['id'] + [f['name'] for f in r['fields'] if f['type'] not in ('json', 'text')]
+    search = r.get('search') or [f['name'] for f in r['fields'] if f['type'] == 'string' and f.get('lst')][:3]
+    entry = {
+        'model': f"App\\Models\\{r['model']}", 'table': r['table'], 'label': r['label'], 'module': r['module'],
+        'perms': perms_for(r), 'rules': rules,
+        'unique': [f['name'] for f in fields if f.get('uniq') and f['type'] != 'fk'],
+        'nonnull': [f['name'] for f in fields if (f.get('req') or 'default' in f or f['type'] == 'bool')],
+        'search': search, 'filters': sorted(set(filters + fk_filter)), 'with': with_,
+        'sortable': sortable, 'order': list(r.get('order', ('id', 'desc'))),
+        'lbl': r.get('lbl', ['id']), 'lbl_fmt': r.get('lbl_fmt'), 'lbl_rel': r.get('lbl_rel'),
+        'creator': r.get('creator'), 'own': r.get('own'),
+        'hooks': ('App\\Support\\Hooks\\' + r['hooks']) if r.get('hooks') else None,
+        'readonly': bool(r.get('readonly')), 'custom_create': bool(r.get('custom_create')),
+        'timestamps': r.get('ts', True),
+    }
+    return entry
+
+
+def registry():
+    items = []
+    for r in spec.RESOURCES:
+        if not r.get('crud', True):
+            continue
+        items.append(f"        {php(r['key'])} => {php(registry_entry(r))},")
+    labels = {r['key']: {'model': f"App\\Models\\{r['model']}", 'lbl': r.get('lbl', ['id']),
+                         'fmt': r.get('lbl_fmt'),
+                         'rel': r.get('lbl_rel')} for r in spec.RESOURCES}
+    lab = '\n'.join(f"        {php(k)} => {php(v)}," for k, v in labels.items())
+    return f"""<?php
+// GENERATED by tools/generate.py. Edit tools/spec.py instead.
+
+namespace App\\Support;
+
+class Resources
+{{
+    /** CRUD resources exposed through the generic controller. */
+    public static function all(): array
+    {{
+        return [
+{chr(10).join(items)}
+        ];
+    }}
+
+    public static function get(string $key): ?array
+    {{
+        return self::all()[$key] ?? null;
+    }}
+
+    /** Label metadata for every resource (used for lookups and relation display). */
+    public static function labels(): array
+    {{
+        return [
+{lab}
+        ];
+    }}
+}}
+"""
+
+
+# ------------------------------------------------------------------ frontend config
+def ts_config():
+    labels, resources = {}, {}
+    for r in spec.RESOURCES:
+        labels[r['key']] = {'cols': r.get('lbl', ['id']), 'fmt': r.get('lbl_fmt')}
+        if not r.get('crud', True):
+            continue
+        columns, fields, filters = [], [], []
+        for fl in r['fields']:
+            if fl.get('lst'):
+                col = {'key': fl['name'], 'label': label_of(fl), 'type': fl['type']}
+                if fl['type'] == 'fk':
+                    col['rel'] = rel_key(fl['name'])
+                    col['ref'] = fl['ref']
+                if fl.get('money'):
+                    col['money'] = True
+                if fl['type'] == 'enum':
+                    col['vals'] = fl['vals']
+                columns.append(col)
+            if fl.get('frm', True):
+                fld = {'name': fl['name'], 'label': label_of(fl), 'type': fl['type'],
+                       'required': bool(fl.get('req'))}
+                for src, dst in (('vals', 'vals'), ('ref', 'ref'), ('dep', 'dep'), ('help', 'help'),
+                                 ('minv', 'min'), ('maxv', 'max')):
+                    if src in fl:
+                        fld[dst] = fl[src]
+                if fl.get('money'):
+                    fld['money'] = True
+                if 'default' in fl:
+                    fld['default'] = fl['default']
+                fields.append(fld)
+            if fl.get('flt'):
+                flt = {'name': fl['name'], 'label': label_of(fl), 'type': fl['type']}
+                if fl['type'] == 'enum':
+                    flt['vals'] = fl['vals']
+                if fl['type'] == 'fk':
+                    flt['ref'] = fl['ref']
+                filters.append(flt)
+        p = perms_for(r)
+        resources[r['key']] = {
+            'key': r['key'], 'label': r['label'], 'module': r['module'], 'perms': p,
+            'readonly': bool(r.get('readonly')), 'customCreate': bool(r.get('custom_create')),
+            'columns': columns, 'fields': fields, 'filters': filters,
+            'search': True,
+        }
+    return ("// GENERATED by tools/generate.py. Edit tools/spec.py instead.\n"
+            "import type { LabelSpec, ResourceConfig } from './types'\n\n"
+            f"export const LABELS: Record<string, LabelSpec> = {json.dumps(labels, indent=1)}\n\n"
+            f"export const RESOURCES: Record<string, ResourceConfig> = {json.dumps(resources, indent=1)}\n")
+
+
+# ------------------------------------------------------------------ seeder
+def seeder():
+    return f"""<?php
+// GENERATED by tools/generate.py. Edit tools/spec.py instead.
+
+namespace Database\\Seeders;
+
+use App\\Models\\Permission;
+use App\\Models\\Role;
+use Illuminate\\Database\\Seeder;
+
+class RolePermissionSeeder extends Seeder
+{{
+    private const MODULES = {php(spec.CATALOG)};
+
+    /** role slug => [name, description, permission patterns] */
+    private const ROLES = {php({k: list(v) for k, v in spec.ROLES.items()})};
+
+    public function run(): void
+    {{
+        $all = [];
+        foreach (self::MODULES as $module => $actions) {{
+            foreach ($actions as $action) {{
+                $name = "{{$module}}.{{$action}}";
+                Permission::updateOrCreate(
+                    ['name' => $name],
+                    ['module' => $module, 'description' => ucfirst(str_replace(['-', '.'], ' ', $name))]
+                );
+                $all[] = $name;
+            }}
+        }}
+
+        foreach (self::ROLES as $slug => [$name, $description, $patterns]) {{
+            $role = Role::updateOrCreate(
+                ['slug' => $slug],
+                ['name' => $name, 'description' => $description, 'is_system' => true]
+            );
+            $granted = array_values(array_filter($all, fn ($p) => $this->matches($p, $patterns)));
+            $role->permissions()->sync(Permission::whereIn('name', $granted)->pluck('id')->all());
+        }}
+    }}
+
+    private function matches(string $permission, array $patterns): bool
+    {{
+        foreach ($patterns as $pattern) {{
+            if ($pattern === '*' || $pattern === $permission) {{
+                return true;
+            }}
+            if (str_ends_with($pattern, '.*') && str_starts_with($permission, substr($pattern, 0, -1))) {{
+                return true;
+            }}
+        }}
+
+        return false;
+    }}
+}}
+"""
+
+
+# ------------------------------------------------------------------ main
+def main():
+    mig_dir = BE / 'database' / 'migrations'
+    for old in mig_dir.glob('*_create_*_tables.php'):
+        if old.name.startswith('2026_11_20_'):
+            old.unlink()
+    n = 4
+    for g in spec.GROUP_ORDER:
+        rs = [r for r in spec.RESOURCES if r['group'] == g]
+        if not rs:
+            continue
+        write(mig_dir / f"2026_11_20_{n:06d}_create_{g}_tables.php", migration(g, rs, n))
+        n += 1
+    for r in spec.RESOURCES:
+        if r.get('model_file', True):
+            write(BE / 'app' / 'Models' / f"{r['model']}.php", model(r))
+    write(BE / 'app' / 'Support' / 'Resources.php', registry())
+    write(BE / 'database' / 'seeders' / 'RolePermissionSeeder.php', seeder())
+    write(FE / 'resources.generated.ts', ts_config())
+    print('generated', len(spec.RESOURCES), 'resources')
+
+
+if __name__ == '__main__':
+    main()

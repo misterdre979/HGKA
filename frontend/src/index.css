@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy: #102b50;
+  --color-royal: #246bce;
+  --color-gold: #e5a52b;
+  --font-display: "Bricolage Grotesque", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  @apply bg-slate-50 text-slate-800 antialiased;
+}
+
+@keyframes block-drop {
+  from { opacity: 0; transform: translateY(-140px) rotate(var(--r0, -12deg)); }
+  to   { opacity: 1; transform: translateY(0) rotate(var(--r1, 0deg)); }
+}
+@keyframes form-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-6px); }
+  40%, 80% { transform: translateX(6px); }
+}
+.block-drop { animation: block-drop 800ms cubic-bezier(0.34, 1.45, 0.64, 1) both; animation-delay: var(--d, 0ms); }
+.form-in { animation: form-in 450ms ease-out both; }
+.shake { animation: shake 380ms ease-in-out; }
+@media (prefers-reduced-motion: reduce) {
+  .block-drop, .form-in, .shake { animation: none; }
+}
